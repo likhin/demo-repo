@@ -1,0 +1,390 @@
+from googleapiclient.discovery import build
+import gzip
+from gcloud import storage
+from google.cloud import bigquery
+from google.cloud import logging
+import os
+import re, sys
+import time
+import pandas as pd
+import numpy as np
+from openpyxl import load_workbook
+from sys import exc_info
+from traceback import format_exception
+from datetime import date,datetime
+today = date.today()
+bq_client = bigquery.Client()
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', None)
+pd.set_option('display.width', 200)
+
+v_stg_bucket = 'gs://'+os.environ.get('v_stg_bucket', 'Stg_bucket environment variable is not set.')
+v_raw_bucket = 'gs://'+os.environ.get('v_raw_bucket', 'Raw_bucket environment variable is not set.')
+v_error_bucket = 'gs://'+os.environ.get('v_error_bucket','error_bucket environment variable  is not set.')
+v_dest_bucket = 'gs://'+os.environ.get('v_dest_bucket','Cleansed_bucket environment variable for app events is not set.')
+stage_path=os.environ.get('v_stage_input_path', 'stage_path environment variable is not set.')
+stage_output_path=os.environ.get('v_stg_output_path', 'stage_output_path environment variable is not set.')
+raw_path=os.environ.get('v_raw_path', 'raw_path environment variable is not set.')
+error_path=os.environ.get('v_error_path', 'error_path environment variable is not set.')
+
+
+
+def get_excel_dataframe(filename, sheet, row_pos, file_format):
+    
+    df = pd.read_excel(filename, sheet_name=sheet, header=row_pos, engine=file_format)
+                       ##, na_values=None)
+    return df
+
+
+def get_4g_report_schema(df):
+      # schema={a
+    #     'SITEID':'SITE_ID',
+    #     'VENDOR':'Vendor',
+    #     'CARRIERS':'Carriers',
+    #     'CARRIER BW WK8':'Carrier_BW',
+    #     'CAP CELL RAG':'Cap_Cell_RAG',
+    #     'CAP CELL RED':'Cap_Cell_Red',
+    #     'CAP CELL AMBER':'Cap_Cell_Amber',
+    #     'CAP CELL GREEN':'Cap_Cell_Green',
+    #     'RRC CONNECTED USERS AVG WK8':'RRC_Connected_Users_Avg',
+    #     'ACTIVE USERS DL AVG WK8':'Active_Users_DL_Avg',
+    #     'NTQ EXIT DATE CATEGORY':'NTQ_Exit_Date_Category',
+    #     'NTQ EXIT DATE':'NTQ_Exit_Date'
+    #   }
+    template_schema = {
+        'SITEID':'SITE_ID',
+        'VENDOR':'Vendor',
+        'CARRIERS':'Carriers',
+        'CARRIER BW WK*':'Carrier_BW',
+        'CAP CELL RAG':'Cap_Cell_RAG',
+        'CAP CELL RED':'Cap_Cell_Red',
+        'CAP CELL AMBER':'Cap_Cell_Amber',
+        'CAP CELL GREEN':'Cap_Cell_Green',
+        'RRC CONNECTED USERS AVG WK*':'RRC_Connected_Users_Avg',
+        'ACTIVE USERS DL AVG WK*':'Active_Users_DL_Avg',
+        'NTQ EXIT DATE CATEGORY':'NTQ_Exit_Date_Category',
+        'NTQ EXIT DATE':'NTQ_Exit_Date'
+      }
+    schema = dict()
+    for col, bq in template_schema.items():
+        if '*' in col:
+            regex = re.compile(col)
+            for c in df.columns:
+                match = re.match(regex, c)
+                if match != None:
+                    schema[c] = template_schema[col]
+        else:
+            schema[col] = template_schema[col]
+            
+    return schema
+
+
+def validation(df):  #checking the specific column present in file .
+    missing_flag = True
+    for i in range(len(df)):
+    
+      try:
+        temp={}
+    
+        SITE_ID = df.loc[i,"SITEID"]
+        Vendor = df.loc[i,"VENDOR"]
+        Carriers= df.loc[i,"CARRIERS"]
+        Cap_Cell_RAG = df.loc[i,"CAP CELL RAG"]
+        Cap_Cell_Red = df.loc[i,"CAP CELL RED"]
+        Cap_Cell_Amber = df.loc[i,"CAP CELL AMBER"]
+        Cap_Cell_Green = df.loc[i,"CAP CELL GREEN"]
+        NTQ_Exit_Date_Category = df.loc[i,"NTQ EXIT DATE CATEGORY"]
+        NTQ_Exit_Date = df.loc[i,"NTQ EXIT DATE"]
+        # RRC_Connected_Users_Avg = df.loc[i,"RRC CONNECTED USERS AVG WK*"]
+        # Carrier_BW = df.loc[i,"CARRIER BW WK*"]
+      except:
+        missing_flag = False
+    print("Validation Value " + str(missing_flag))
+    return missing_flag
+
+def remove_existing_files(stage_full_path):
+
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(os.environ.get('v_stg_bucket'))
+        
+        ## Removing existing files from stage op path
+        print("Removing existing files before loading")
+        blob_name=stage_output_path
+        print('Deleting existing files from {}'.format(stage_full_path))
+        blobs = bucket.list_blobs(prefix=blob_name)
+        for blob in blobs:
+            blob.delete()
+        print('Deleted files from {}'.format(stage_full_path)) 
+
+        ## Removing existing files from BQ path
+        blob_name2=os.environ.get('v_delete_BQ_path')
+        print('Deleting existing files from {}'.format(blob_name2))
+        blobs = bucket.list_blobs(prefix=blob_name2)
+        for blob in blobs:
+            blob.delete()
+        print('Deleted files from {}'.format(blob_name2)) 
+        
+        ## Removing existing files from stage ip path
+        blob_name3 = os.environ.get('v_stage_input_path')
+        print('Deleting existing files from {}'.format(blob_name3))
+        blobs = bucket.list_blobs(prefix=blob_name3)
+        for blob in blobs:
+            blob.delete()
+        print('Deleted files from {}'.format(blob_name3)) 
+        
+    except Exception as e:
+        etype, value, tb = exc_info()
+        info, error = format_exception(etype, value, tb)[-2:]
+        print(f'Exception in:\n{info}\n{error}')
+        log_client = logging.Client()
+        logger = log_client.logger('ER_009_4G_REPORT')
+        logger.log_text('Cloud Function: Job Failed with error: '+info+' '+error, severity='ERROR')
+
+
+def report_4g_schema_correction(df,schema):
+
+    try:    
+        print("Before schema correction")
+        print(df)    
+        print("After schema correction") 
+        ## Rename columns to match BQ table schema    
+        df = df.rename(columns=schema)
+        print(df)
+        ## Reorder columns
+        df = df.reindex(columns=['SITE_ID', 'Vendor', 'Carriers', 'Carrier_BW', 'Cap_Cell_RAG', 'Cap_Cell_Red', 'Cap_Cell_Amber', 'Cap_Cell_Green', 'RRC_Connected_Users_Avg', 'Active_Users_DL_Avg', 'NTQ_Exit_Date_Category', 'NTQ_Exit_Date'])
+        return df
+        
+    except Exception as e:
+        etype, value, tb = exc_info()
+        info, error = format_exception(etype, value, tb)[-2:]
+        print(f'Exception in:\n{info}\n{error}')
+        log_client = logging.Client()
+        logger = log_client.logger('ER_009_4G_REPORT')
+        logger.log_text('Cloud Function: Job Failed with error: '+info+' '+error, severity='ERROR')
+    
+
+def update_schema_like_bq_table(df, schema):    
+    try:
+    
+        df = report_4g_schema_correction(df, schema)        
+        df = df.assign(bq_insert_date=today.strftime("%Y-%m-%d")) #bq insert for partitoin  
+        print("Updated the schema with date")
+        ## Writing to csv
+        print(df)
+        print("Writing to CSV")
+        write_to_csv(df)
+        
+    except Exception as e:
+        etype, value, tb = exc_info()
+        info, error = format_exception(etype, value, tb)[-2:]
+        print(f'Exception in:\n{info}\n{error}')
+        log_client = logging.Client()
+        logger = log_client.logger('ER_009_4G_REPORT')
+        logger.log_text('Cloud Function: Job Failed with error: '+info+' '+error, severity='ERROR')
+    
+
+def perform_4g_report_data_read(bin_filename):
+    
+    try:
+        print("perform_4g_report_data_read")        
+        file_format=bin_filename.split('/')[-1].split('.')[-1]
+        engine=''
+
+        if file_format=='xlsb':
+            engine='pyxlsb'
+        else:
+            engine='openpyxl'
+
+        ## 4g report Data
+        report_4g_df=get_excel_dataframe(bin_filename, 'REPORT', 0, engine)
+        validation_value= validation(report_4g_df) # calling validation 
+        if validation_value ==  True:
+                update_schema_like_bq_table(report_4g_df, get_4g_report_schema(report_4g_df))
+                return validation_value
+        else:
+            return validation_value
+           
+    except Exception as e:
+        etype, value, tb = exc_info()
+        info, error = format_exception(etype, value, tb)[-2:]
+        print(f'Exception in:\n{info}\n{error}')
+        log_client = logging.Client()
+        logger = log_client.logger('ER_009_4G_REPORT')
+        logger.log_text('Cloud Function: Job Failed with error: '+info+' '+error, severity='ERROR')
+    
+
+def get_values(file):
+    # Working on 4g report data, which is in xlsx format
+    filename=v_stg_bucket+'/'+stage_path+file
+    valid_file =  perform_4g_report_data_read(filename)
+    return valid_file
+    
+
+
+def write_to_csv(data):
+
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(os.environ.get('v_stg_bucket'))
+        stage_full_path=v_stg_bucket+'/'+stage_output_path
+
+        ## Writing to CSV
+        print("stage_full_path={}".format(stage_full_path))
+        remove_existing_files(stage_full_path)
+        data = data.replace(r'\n',' | ', regex=True)
+        data = data.replace(r'\r',' | ', regex=True)
+        data.to_csv(stage_full_path+'4g_report_'+today.strftime("%Y%m%d")+'.csv',index=False,header=True) 
+        print('Written csv to path:{}'.format(stage_full_path))
+        
+    except Exception as e:
+        etype, value, tb = exc_info()
+        info, error = format_exception(etype, value, tb)[-2:]
+        print(f'Exception in:\n{info}\n{error}')
+        log_client = logging.Client()
+        logger = log_client.logger('ER_009_4G_REPORT')
+        logger.log_text('Cloud Function: Job Failed with error: '+info+' '+error, severity='ERROR')
+
+
+def call_dataflow(parameters):
+    
+    try:
+        project = os.environ.get('v_project', 'v_project environment variable is not set.')
+        report_4g_template=os.environ.get('v_4g_report_template', '4g_report_template environment variable is not set.')
+        curr_dtime = datetime.now()
+        curr_dtime_str = curr_dtime.strftime("%d%m%Y%H%M%S")
+        table_name=parameters['bq_tab'].split('.')[-1]
+        job = 'bt-'+ table_name+'-' + curr_dtime_str
+
+        ## adding parameter for job name
+        parameters['job_nm']=job
+        
+        dataflow = build('dataflow', 'v1b3', cache_discovery=False)
+        
+        request_comp = dataflow.projects().locations().templates().launch(
+                                projectId=project,
+                                gcsPath=report_4g_template,
+                                location='europe-west2',
+                                body={
+                                'jobName': job,
+                                'parameters': parameters
+                                }
+                                )
+        print('Submitting Dataflow job with parameters: {}'.format(parameters)) 
+        request_comp.execute()
+        print('Dataflow job submitted!')
+        
+    except Exception as e:
+        etype, value, tb = exc_info()
+        info, error = format_exception(etype, value, tb)[-2:]
+        print(f'Exception in:\n{info}\n{error}')
+        log_client = logging.Client()
+        logger = log_client.logger('ER_009_4G_REPORT')
+        logger.log_text('Cloud Function: Job Failed with error: '+info+' '+error, severity='ERROR')
+
+
+def cf_4g_report(event, context):
+    
+    try:
+        client = storage.Client()
+        bucket = client.bucket(event['bucket'])
+        print(bucket)
+        blob = bucket.get_blob(event['name'])
+        print(blob)
+        curr_dtime = datetime.now()
+        curr_dtime_str = curr_dtime.strftime("%Y-%m-%d")       
+        stg_bucket = client.bucket(os.environ.get('v_stg_bucket', 'Stg_bucket environment variable is not set.'))
+        raw_bucket = client.bucket(os.environ.get('v_raw_bucket', 'Raw_bucket environment variable is not set.'))
+        dest_bucket = client.bucket(os.environ.get('v_dest_bucket','Cleansed_bucket environment variable for app events is not set.'))
+        
+        ## Filename of excel file
+        filename = event['name']
+        if '4g-report-file/4G' in filename:
+            print("filename={}".format(filename))
+
+            # copy to the raw bucket as archive
+            print('Moving file : {}  to stage bucket raw folder'.format(filename))
+            bucket.copy_blob(blob=blob, destination_bucket=raw_bucket, new_name=raw_path+filename)
+            print('Moved to raw bucket')
+            # copy raw file to staging folder
+            print('Moving file : {}  to stage bucket stg_input folder'.format(filename))
+            bucket.copy_blob(blob=blob, destination_bucket=stg_bucket, new_name=stage_path+filename)
+            print('Moved to stage bucket')
+
+            blob.delete()
+            print('Removed file : {}  from landing bucket'.format(filename))
+            checks = get_values(filename)
+            print("checks" +str(checks))
+            if checks == True:
+                stg_file_full_path=v_stg_bucket+'/'+stage_path+filename
+
+
+                print("perform_4g_report_data_read")
+                file1 = filename
+                filename1=v_stg_bucket+'/'+stage_path+file1
+
+                file_format=filename1.split('/')[-1].split('.')[-1]
+                engine=''
+
+                if file_format=='xlsb':
+                    engine='pyxlsb'
+                else:
+                    engine='openpyxl'
+
+            
+                
+                print('Written to CSV. Calling Dataflow..')
+                        
+                load_bq_path=os.environ.get('v_delete_BQ_path')
+                stage_full_path=v_stg_bucket+'/'+stage_output_path
+                load_bq_full_path=v_stg_bucket+'/'+load_bq_path
+                entity=os.environ.get('entity', 'entity environment variable is not set.')
+                bq_table=os.environ.get('v_4g_report_tab', 'v_4g_report_tab environment variable is not set.')
+
+                print('Entity={}'.format(entity))
+                print("Passing parameters to Dataflow")
+
+                ## Dataflow for Statement of compliance
+                print("Passing parameters for VM Dataflow")
+                parameters={
+                            'entity':entity,
+                            'stg_output_path':stage_full_path,
+                            'load_bq_path':load_bq_full_path+'4g_report_'+today.strftime("%Y%m%d"),
+                            'bq_tab':bq_table,
+                            'filename':filename
+                            }
+                call_dataflow(parameters)  
+            else:
+                log_client = logging.Client()
+                logger = log_client.logger('ER_009_4G_REPORT')
+                logger.log_text('file with wrong schema, Sheet name or invalid file received:',severity='ERROR')
+                print("No need to process")
+                client = storage.Client()
+                bucket_stage = client.bucket(os.environ.get('v_stg_bucket'))
+                print("stage bucket", bucket_stage) 
+                bucket_error = client.bucket(os.environ.get('v_error_bucket')) 
+                print("error_bucket", bucket_error)
+                blob_stage = bucket_stage.list_blobs(prefix=stage_path )         
+                for blob in blob_stage:
+                    print("blobname" + str(blob.name))
+                    filename = str(blob.name) 
+                    bucket_stage.copy_blob(blob=blob, destination_bucket=bucket_error, new_name=error_path+ "/" +curr_dtime_str+ "/"+str(filename.split('/')[-1]))
+                    print("file moved to error bucket")
+                    print("deleting invalid file")
+                    blob.delete() 
+        else:
+            print("No need to process")      
+            exit()
+    except Exception as e:
+        etype, value, tb = exc_info()
+        info, error = format_exception(etype, value, tb)[-2:]
+        print(f'Exception in:\n{info}\n{error}')
+        log_client = logging.Client()
+        logger = log_client.logger('ER_009_4G_REPORT')
+        logger.log_text('Cloud Function: Job Failed with error: '+info+' '+error, severity='ERROR')
+    
+
+    
+
+
